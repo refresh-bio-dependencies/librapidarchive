@@ -27,6 +27,28 @@
 namespace rapidgzip
 {
 /**
+ * Optional hooks called by the worker threads of every ThreadPool right before and right after each task,
+ * e.g., to take a slot of a CPU budget shared with the application using rapidgzip (KMC does this).
+ * Both functions must be set, must not throw, and are called in pairs in the same thread.
+ * The hooks object must outlive all thread pools that may use it.
+ */
+struct ThreadPoolTaskHooks
+{
+    void ( *beforeTask )( void* context ){ nullptr };
+    void ( *afterTask )( void* context ){ nullptr };
+    void* context{ nullptr };
+};
+
+
+[[nodiscard]] inline std::atomic<const ThreadPoolTaskHooks*>&
+threadPoolTaskHooks()
+{
+    static std::atomic<const ThreadPoolTaskHooks*> hooks{ nullptr };
+    return hooks;
+}
+
+
+/**
  * Function evaluations can be given to a ThreadPool instance,
  * which assigns the evaluation to one of its threads to be evaluated in parallel.
  */
@@ -153,6 +175,7 @@ public:
         std::packaged_task<ReturnType()> packagedTask{ std::forward<T_Functor>( task ) };
         auto resultFuture = packagedTask.get_future();
         m_tasks[priority].emplace_back( std::move( packagedTask ) );
+        ++m_taskCount;
 
         if ( ( m_threads.size() < m_threadCount ) && ( m_idleThreadCount == 0 ) ) {
             spawnThread();
@@ -186,6 +209,15 @@ private:
      * Does not lock! Therefore it is a private method that should only be called with a lock.
      */
     [[nodiscard]] bool
+    hasUnclaimedTasks() const
+    {
+        return m_taskCount > m_claimedTaskCount;
+    }
+
+    /**
+     * Does not lock! Therefore it is a private method that should only be called with a lock.
+     */
+    [[nodiscard]] bool
     hasUnprocessedTasks() const
     {
         return std::any_of( m_tasks.begin(), m_tasks.end(),
@@ -203,20 +235,39 @@ private:
         {
             std::unique_lock<std::mutex> tasksLock( m_mutex );
             ++m_idleThreadCount;
-            m_pingWorkers.wait( tasksLock, [this] () { return hasUnprocessedTasks() || !m_threadPoolRunning; } );
+            m_pingWorkers.wait( tasksLock, [this] () { return hasUnclaimedTasks() || !m_threadPoolRunning; } );
             --m_idleThreadCount;
 
             if ( !m_threadPoolRunning ) {
                 break;
             }
 
+            /* Claim a task first and pick the concrete one only after beforeTask returned (it may wait for
+             * a CPU slot), so that the task priorities still hold and at most one waiting worker per task. */
+            ++m_claimedTaskCount;
+            const auto* const hooks = threadPoolTaskHooks().load( std::memory_order_acquire );
+            if ( hooks != nullptr ) {
+                tasksLock.unlock();
+                hooks->beforeTask( hooks->context );
+                tasksLock.lock();
+            }
+            --m_claimedTaskCount;
+
             const auto nonEmptyTasks = std::find_if( m_tasks.begin(), m_tasks.end(),
                                                      [] ( const auto& tasks ) { return !tasks.second.empty(); } );
-            if ( nonEmptyTasks != m_tasks.end() ) {
+            if ( m_threadPoolRunning && ( nonEmptyTasks != m_tasks.end() ) ) {
                 auto task = std::move( nonEmptyTasks->second.front() );
                 nonEmptyTasks->second.pop_front();
+                --m_taskCount;
                 tasksLock.unlock();
+
                 task();
+            } else {
+                tasksLock.unlock();
+            }
+
+            if ( hooks != nullptr ) {
+                hooks->afterTask( hooks->context );
             }
         }
     }
@@ -235,6 +286,9 @@ private:
     std::atomic<size_t> m_idleThreadCount{ 0 };
 
     std::map</* priority */ int, std::deque<PackagedTaskWrapper> > m_tasks;
+    /** Number of tasks in m_tasks and number of workers that will pop one of them after beforeTask. */
+    size_t m_taskCount{ 0 };
+    size_t m_claimedTaskCount{ 0 };
     /** necessary for m_tasks AND m_pingWorkers or else the notify_all might go unnoticed! */
 
     mutable std::mutex m_mutex;
